@@ -73,11 +73,11 @@ export class Authenticator {
       this.logger.info('Requesting QR code...')
       const qr = await this.api.getQrCode(baseUrl)
 
-      // Notify caller about the QR URL
+      // Pass QR URL to developer's callback — display is their responsibility
       if (callbacks?.onQrUrl) {
         callbacks.onQrUrl(qr.qrcode_img_content)
       } else {
-        this.logger.info(`Scan this URL in WeChat: ${qr.qrcode_img_content}`)
+        this.logger.info(`Scan this QR code in WeChat: ${qr.qrcode_img_content}`)
       }
 
       let lastStatus: string | undefined
