@@ -1,0 +1,428 @@
+//! Main WeChatBot client.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, RwLock};
+use tokio::time::{sleep, Duration};
+use tracing::{error, info, warn};
+
+use crate::error::{Result, WeChatBotError};
+use crate::protocol::{self, ILinkClient};
+use crate::types::*;
+
+/// Message handler callback type.
+pub type MessageHandler = Box<dyn Fn(&IncomingMessage) + Send + Sync>;
+
+/// Bot configuration options.
+pub struct BotOptions {
+    pub base_url: Option<String>,
+    pub cred_path: Option<String>,
+    pub on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    pub on_error: Option<Box<dyn Fn(&WeChatBotError) + Send + Sync>>,
+}
+
+impl Default for BotOptions {
+    fn default() -> Self {
+        Self {
+            base_url: None,
+            cred_path: None,
+            on_qr_url: None,
+            on_error: None,
+        }
+    }
+}
+
+/// WeChatBot is the main entry point.
+pub struct WeChatBot {
+    client: Arc<ILinkClient>,
+    credentials: RwLock<Option<Credentials>>,
+    context_tokens: RwLock<HashMap<String, String>>,
+    handlers: Mutex<Vec<MessageHandler>>,
+    cursor: RwLock<String>,
+    base_url: RwLock<String>,
+    cred_path: Option<String>,
+    stopped: RwLock<bool>,
+    on_qr_url: Option<Box<dyn Fn(&str) + Send + Sync>>,
+    on_error: Option<Box<dyn Fn(&WeChatBotError) + Send + Sync>>,
+}
+
+impl WeChatBot {
+    /// Create a new bot instance.
+    pub fn new(opts: BotOptions) -> Self {
+        Self {
+            client: Arc::new(ILinkClient::new()),
+            credentials: RwLock::new(None),
+            context_tokens: RwLock::new(HashMap::new()),
+            handlers: Mutex::new(Vec::new()),
+            cursor: RwLock::new(String::new()),
+            base_url: RwLock::new(
+                opts.base_url
+                    .unwrap_or_else(|| protocol::DEFAULT_BASE_URL.to_string()),
+            ),
+            cred_path: opts.cred_path,
+            stopped: RwLock::new(false),
+            on_qr_url: opts.on_qr_url,
+            on_error: opts.on_error,
+        }
+    }
+
+    /// Login via QR code. Returns credentials on success.
+    pub async fn login(&self, force: bool) -> Result<Credentials> {
+        let base_url = self.base_url.read().await.clone();
+
+        if !force {
+            if let Some(creds) = self.load_credentials().await? {
+                *self.credentials.write().await = Some(creds.clone());
+                *self.base_url.write().await = creds.base_url.clone();
+                info!("Loaded stored credentials for {}", creds.user_id);
+                return Ok(creds);
+            }
+        }
+
+        // QR code login flow
+        loop {
+            let qr = self.client.get_qr_code(&base_url).await?;
+
+            if let Some(ref cb) = self.on_qr_url {
+                cb(&qr.qrcode_img_content);
+            } else {
+                eprintln!("[wechatbot] Scan: {}", qr.qrcode_img_content);
+            }
+
+            let mut last_status = String::new();
+            loop {
+                let status = self.client.poll_qr_status(&base_url, &qr.qrcode).await?;
+
+                if status.status != last_status {
+                    last_status = status.status.clone();
+                    match status.status.as_str() {
+                        "scaned" => info!("QR scanned — confirm in WeChat"),
+                        "expired" => warn!("QR expired — requesting new one"),
+                        "confirmed" => info!("Login confirmed"),
+                        _ => {}
+                    }
+                }
+
+                if status.status == "confirmed" {
+                    let token = status.bot_token.ok_or_else(|| {
+                        WeChatBotError::Auth("missing bot_token".into())
+                    })?;
+                    let creds = Credentials {
+                        token,
+                        base_url: status.baseurl.unwrap_or_else(|| base_url.clone()),
+                        account_id: status.ilink_bot_id.unwrap_or_default(),
+                        user_id: status.ilink_user_id.unwrap_or_default(),
+                        saved_at: Some(chrono_now()),
+                    };
+                    self.save_credentials(&creds).await?;
+                    *self.credentials.write().await = Some(creds.clone());
+                    *self.base_url.write().await = creds.base_url.clone();
+                    return Ok(creds);
+                }
+
+                if status.status == "expired" {
+                    break;
+                }
+
+                sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+
+    /// Register a message handler.
+    pub async fn on_message(&self, handler: MessageHandler) {
+        self.handlers.lock().await.push(handler);
+    }
+
+    /// Reply to an incoming message.
+    pub async fn reply(&self, msg: &IncomingMessage, text: &str) -> Result<()> {
+        self.context_tokens
+            .write()
+            .await
+            .insert(msg.user_id.clone(), msg.context_token.clone());
+        self.send_text(&msg.user_id, text, &msg.context_token).await
+    }
+
+    /// Send text to a user (needs prior context_token).
+    pub async fn send(&self, user_id: &str, text: &str) -> Result<()> {
+        let ct = self.context_tokens.read().await.get(user_id).cloned();
+        let ct = ct.ok_or_else(|| WeChatBotError::NoContext(user_id.to_string()))?;
+        self.send_text(user_id, text, &ct).await
+    }
+
+    /// Show "typing..." indicator.
+    pub async fn send_typing(&self, user_id: &str) -> Result<()> {
+        let ct = self.context_tokens.read().await.get(user_id).cloned();
+        let ct = ct.ok_or_else(|| WeChatBotError::NoContext(user_id.to_string()))?;
+        let (base_url, token) = self.get_auth().await?;
+        let config = self.client.get_config(&base_url, &token, user_id, &ct).await?;
+        if let Some(ticket) = config.typing_ticket {
+            self.client.send_typing(&base_url, &token, user_id, &ticket, 1).await?;
+        }
+        Ok(())
+    }
+
+    /// Start the long-poll loop. Blocks until stopped.
+    pub async fn run(&self) -> Result<()> {
+        *self.stopped.write().await = false;
+        info!("Long-poll loop started");
+        let mut retry_delay = Duration::from_secs(1);
+
+        loop {
+            if *self.stopped.read().await {
+                break;
+            }
+
+            let (base_url, token) = self.get_auth().await?;
+            let cursor = self.cursor.read().await.clone();
+
+            match self.client.get_updates(&base_url, &token, &cursor).await {
+                Ok(updates) => {
+                    if !updates.get_updates_buf.is_empty() {
+                        *self.cursor.write().await = updates.get_updates_buf;
+                    }
+                    retry_delay = Duration::from_secs(1);
+
+                    for wire in &updates.msgs {
+                        self.remember_context(wire).await;
+                        if let Some(incoming) = parse_message(wire) {
+                            let handlers = self.handlers.lock().await;
+                            for handler in handlers.iter() {
+                                handler(&incoming);
+                            }
+                        }
+                    }
+                }
+                Err(e) if e.is_session_expired() => {
+                    warn!("Session expired — re-login required");
+                    *self.context_tokens.write().await = HashMap::new();
+                    *self.cursor.write().await = String::new();
+                    if let Err(e) = self.login(true).await {
+                        self.report_error(&e);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    self.report_error(&e);
+                    sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, Duration::from_secs(10));
+                    continue;
+                }
+            }
+        }
+
+        info!("Long-poll loop stopped");
+        Ok(())
+    }
+
+    /// Stop the bot.
+    pub async fn stop(&self) {
+        *self.stopped.write().await = true;
+    }
+
+    // --- internal ---
+
+    async fn send_text(&self, user_id: &str, text: &str, context_token: &str) -> Result<()> {
+        let (base_url, token) = self.get_auth().await?;
+        for chunk in chunk_text(text, 2000) {
+            let msg = protocol::build_text_message(user_id, context_token, &chunk);
+            self.client.send_message(&base_url, &token, &msg).await?;
+        }
+        Ok(())
+    }
+
+    async fn remember_context(&self, wire: &WireMessage) {
+        let user_id = if wire.message_type == MessageType::User {
+            &wire.from_user_id
+        } else {
+            &wire.to_user_id
+        };
+        if !user_id.is_empty() && !wire.context_token.is_empty() {
+            self.context_tokens
+                .write()
+                .await
+                .insert(user_id.clone(), wire.context_token.clone());
+        }
+    }
+
+    async fn get_auth(&self) -> Result<(String, String)> {
+        let creds = self.credentials.read().await;
+        let creds = creds.as_ref().ok_or_else(|| {
+            WeChatBotError::Auth("not logged in".into())
+        })?;
+        Ok((creds.base_url.clone(), creds.token.clone()))
+    }
+
+    async fn load_credentials(&self) -> Result<Option<Credentials>> {
+        let path = self.cred_path.clone().unwrap_or_else(default_cred_path);
+        match tokio::fs::read_to_string(&path).await {
+            Ok(data) => Ok(Some(serde_json::from_str(&data)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    async fn save_credentials(&self, creds: &Credentials) -> Result<()> {
+        let path = self.cred_path.clone().unwrap_or_else(default_cred_path);
+        let dir = std::path::Path::new(&path).parent().unwrap();
+        tokio::fs::create_dir_all(dir).await?;
+        let data = serde_json::to_string_pretty(creds)?;
+        tokio::fs::write(&path, format!("{}\n", data)).await?;
+        Ok(())
+    }
+
+    fn report_error(&self, err: &WeChatBotError) {
+        error!("{}", err);
+        if let Some(ref cb) = self.on_error {
+            cb(err);
+        }
+    }
+}
+
+fn parse_message(wire: &WireMessage) -> Option<IncomingMessage> {
+    if wire.message_type != MessageType::User {
+        return None;
+    }
+
+    let mut msg = IncomingMessage {
+        user_id: wire.from_user_id.clone(),
+        text: extract_text(&wire.item_list),
+        content_type: detect_type(&wire.item_list),
+        timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_millis(wire.create_time_ms as u64),
+        images: Vec::new(),
+        voices: Vec::new(),
+        files: Vec::new(),
+        videos: Vec::new(),
+        quoted: None,
+        raw: wire.clone(),
+        context_token: wire.context_token.clone(),
+    };
+
+    for item in &wire.item_list {
+        if let Some(ref img) = item.image_item {
+            msg.images.push(ImageContent {
+                media: img.media.clone(),
+                thumb_media: img.thumb_media.clone(),
+                aes_key: img.aeskey.clone(),
+                url: img.url.clone(),
+                width: img.thumb_width,
+                height: img.thumb_height,
+            });
+        }
+        if let Some(ref voice) = item.voice_item {
+            msg.voices.push(VoiceContent {
+                media: voice.media.clone(),
+                text: voice.text.clone(),
+                duration_ms: voice.playtime,
+                encode_type: voice.encode_type,
+            });
+        }
+        if let Some(ref file) = item.file_item {
+            msg.files.push(FileContent {
+                media: file.media.clone(),
+                file_name: file.file_name.clone(),
+                md5: file.md5.clone(),
+                size: file.len.as_ref().and_then(|s| s.parse().ok()),
+            });
+        }
+        if let Some(ref video) = item.video_item {
+            msg.videos.push(VideoContent {
+                media: video.media.clone(),
+                thumb_media: video.thumb_media.clone(),
+                duration_ms: video.play_length,
+            });
+        }
+        if let Some(ref refm) = item.ref_msg {
+            msg.quoted = Some(QuotedMessage {
+                title: refm.title.clone(),
+                text: refm
+                    .message_item
+                    .as_ref()
+                    .and_then(|i| i.text_item.as_ref())
+                    .map(|t| t.text.clone()),
+            });
+        }
+    }
+
+    Some(msg)
+}
+
+fn detect_type(items: &[WireMessageItem]) -> ContentType {
+    items.first().map_or(ContentType::Text, |item| match item.item_type {
+        MessageItemType::Image => ContentType::Image,
+        MessageItemType::Voice => ContentType::Voice,
+        MessageItemType::File => ContentType::File,
+        MessageItemType::Video => ContentType::Video,
+        _ => ContentType::Text,
+    })
+}
+
+fn extract_text(items: &[WireMessageItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item.item_type {
+            MessageItemType::Text => item.text_item.as_ref().map(|t| t.text.clone()),
+            MessageItemType::Image => Some(
+                item.image_item
+                    .as_ref()
+                    .and_then(|i| i.url.clone())
+                    .unwrap_or_else(|| "[image]".to_string()),
+            ),
+            MessageItemType::Voice => Some(
+                item.voice_item
+                    .as_ref()
+                    .and_then(|v| v.text.clone())
+                    .unwrap_or_else(|| "[voice]".to_string()),
+            ),
+            MessageItemType::File => Some(
+                item.file_item
+                    .as_ref()
+                    .and_then(|f| f.file_name.clone())
+                    .unwrap_or_else(|| "[file]".to_string()),
+            ),
+            MessageItemType::Video => Some("[video]".to_string()),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn chunk_text(text: &str, limit: usize) -> Vec<String> {
+    if text.len() <= limit {
+        return vec![text.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        if remaining.len() <= limit {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        let window = &remaining[..limit];
+        let cut = window.rfind("\n\n")
+            .filter(|&i| i > limit * 3 / 10)
+            .map(|i| i + 2)
+            .or_else(|| window.rfind('\n').filter(|&i| i > limit * 3 / 10).map(|i| i + 1))
+            .or_else(|| window.rfind(' ').filter(|&i| i > limit * 3 / 10).map(|i| i + 1))
+            .unwrap_or(limit);
+        chunks.push(remaining[..cut].to_string());
+        remaining = &remaining[cut..];
+    }
+    if chunks.is_empty() {
+        vec![String::new()]
+    } else {
+        chunks
+    }
+}
+
+fn default_cred_path() -> String {
+    let home = dirs_next::home_dir().unwrap_or_else(|| ".".into());
+    home.join(".wechatbot").join("credentials.json").to_string_lossy().to_string()
+}
+
+fn chrono_now() -> String {
+    // Simple ISO 8601 without chrono dependency
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    format!("{}Z", dur.as_secs())
+}

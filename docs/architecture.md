@@ -1,0 +1,115 @@
+# Architecture
+
+All three SDKs (Node.js, Go, Rust) follow the same layered architecture and expose a consistent API surface.
+
+## Layers
+
+```
+┌────────────────────────────────────────┐
+│            Application                 │  ← Your bot code
+├────────────────────────────────────────┤
+│         Middleware (Node.js)           │  ← Optional processing pipeline
+├────────────────────────────────────────┤
+│           Bot Client                   │  ← Orchestrator: login, run, reply
+├────────┬──────────┬──────────┬─────────┤
+│ Poller │  Sender  │  Typing  │  Media  │  ← Services
+├────────┴──────────┴──────────┴─────────┤
+│          Context Store                 │  ← context_token lifecycle
+├────────────────────────────────────────┤
+│           Protocol / API               │  ← Raw HTTP calls to iLink
+├────────────────────────────────────────┤
+│         Transport / HTTP               │  ← HTTP client with retry
+├────────────────────────────────────────┤
+│            Storage                     │  ← Credentials + state persistence
+└────────────────────────────────────────┘
+```
+
+## SDK Comparison
+
+| Feature | Node.js | Go | Rust |
+|---|---|---|---|
+| Package | `@anthropic/wechatbot` | `github.com/anthropic/wechatbot-go` | `wechatbot` (crates.io) |
+| Async model | `async/await` (Promises) | goroutines + `context.Context` | `async/await` (tokio) |
+| Middleware | ✓ Express-style pipeline | — (use handler composition) | — (use closures) |
+| Storage | Pluggable (file/memory/custom) | File-based | File-based |
+| Media crypto | ✓ AES-128-ECB | ✓ AES-128-ECB | ✓ AES-128-ECB |
+| Events | Typed EventEmitter | Callbacks (OnError, OnQRURL) | Callbacks |
+| Error types | 6 typed error classes | APIError with methods | thiserror enum |
+| Dependencies | 0 runtime | stdlib only | reqwest, serde, aes, tokio |
+
+## Shared Concepts
+
+### context_token
+Every reply must include the `context_token` from the incoming message. All SDKs:
+1. Cache tokens in memory per `(userId)`
+2. Auto-extract from incoming messages
+3. Auto-inject into outgoing messages via `reply()`
+4. (Node.js) Persist to storage for restart survival
+
+### QR Login Flow
+All SDKs implement the same flow:
+1. `GET /get_bot_qrcode` → get QR URL
+2. Display QR to user
+3. `GET /get_qrcode_status` poll loop (2s interval)
+4. On `confirmed` → extract credentials, persist to `~/.wechatbot/`
+5. On `expired` → request new QR
+
+### Long-Poll Loop
+1. `POST /getupdates` with cursor (35s server hold)
+2. Parse messages, cache context_tokens
+3. Dispatch to handlers
+4. On `-14` error → clear state, re-login
+5. On network error → exponential backoff (1s → 10s max)
+
+### Text Chunking
+All SDKs split text at 2000 characters:
+- Priority: paragraph break (`\n\n`) → line break (`\n`) → space → hard cut
+- Each chunk gets a unique `client_id`
+- All chunks share the same `context_token`
+
+## File Structure
+
+### Node.js
+```
+nodejs/
+├── src/                    # 42 source files across 10 modules
+│   ├── core/               # Client, events, errors
+│   ├── transport/          # HTTP with retry
+│   ├── protocol/           # Wire types + API calls
+│   ├── auth/               # QR login
+│   ├── messaging/          # Poller, sender, typing, context
+│   ├── media/              # AES crypto, CDN up/down
+│   ├── middleware/          # Engine + 4 builtins
+│   ├── message/            # Parser, builder, types
+│   ├── storage/            # File, memory, interface
+│   └── logger/             # Structured logging
+├── tests/                  # 41 unit tests
+└── examples/               # 3 example bots
+```
+
+### Go
+```
+golang/
+├── types.go                # All public types
+├── bot.go                  # Bot client
+├── internal/
+│   ├── protocol/api.go     # iLink HTTP calls
+│   ├── auth/login.go       # QR login + credentials
+│   └── crypto/aes.go       # AES-128-ECB
+└── examples/
+    └── echo-bot/main.go
+```
+
+### Rust
+```
+rust/
+├── src/
+│   ├── lib.rs              # Re-exports
+│   ├── types.rs            # All types (serde)
+│   ├── error.rs            # Error hierarchy
+│   ├── protocol.rs         # iLink API calls
+│   ├── crypto.rs           # AES-128-ECB + tests
+│   └── bot.rs              # Bot client
+└── examples/
+    └── echo_bot.rs
+```

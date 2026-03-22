@@ -1,0 +1,12 @@
+{
+  "metadata": {
+    "title": "WeChatBot — Modular WeChat iLink Bot SDK for Node.js",
+    "description": "Production-grade WeChat bot SDK with middleware pipeline, media support, pluggable storage, and automatic session recovery. Zero runtime dependencies."
+  },
+  "nav": {
+    "home": "Home"
+  },
+  "locale": {
+    "switchTo": "中文"
+  }
+}

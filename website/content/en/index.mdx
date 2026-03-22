@@ -1,0 +1,403 @@
+---
+title: "WeChatBot — Modular WeChat iLink Bot SDK for Node.js"
+description: "Production-grade WeChat bot SDK with middleware pipeline, media support, pluggable storage, and automatic session recovery. Zero runtime dependencies."
+toc:
+  - label: "Quick start"
+    href: "#quick-start"
+  - label: "Architecture"
+    href: "#architecture"
+  - label: "How it works"
+    href: "#how-it-works"
+  - label: "Middleware"
+    href: "#middleware"
+  - label: "Media"
+    href: "#media"
+  - label: "Storage"
+    href: "#storage"
+  - label: "Events"
+    href: "#events"
+  - label: "Message builder"
+    href: "#message-builder"
+  - label: "Comparison"
+    href: "#comparison"
+  - label: "Protocol"
+    href: "#protocol"
+  - label: "Security"
+    href: "#security"
+---
+
+A modular, extensible WeChat iLink Bot SDK for Node.js — with middleware pipeline, full media support, pluggable storage, and automatic session recovery. **Zero runtime dependencies**, TypeScript-first, production-grade. Inspired by [tencent-weixin/openclaw-weixin-cli](https://github.com/nicepkg/openclaw-weixin). [GitHub](https://github.com/anthropic/wechatbot).
+
+Your agent connects to WeChat via the iLink Bot protocol — QR code login, long-poll message receiving, and HTTP message sending. The SDK handles **all the complexity**: `context_token` lifecycle, AES-128-ECB media encryption, typing indicators, session recovery, and smart text chunking.
+
+<Section id="quick-start" title="Quick start">
+
+**Three steps** to a working WeChat bot.
+
+1. Install the SDK:
+
+```bash
+npm install @anthropic/wechatbot
+```
+
+2. Create your bot:
+
+```typescript
+import { WeChatBot } from '@anthropic/wechatbot'
+
+const bot = new WeChatBot()
+await bot.login()
+
+bot.onMessage(async (msg) => {
+  await bot.sendTyping(msg.userId)
+  await bot.reply(msg, `Echo: ${msg.text}`)
+})
+
+await bot.start()
+```
+
+3. Scan the QR code in WeChat when prompted. Done — your bot is live.
+
+Credentials are **automatically saved** to `~/.wechatbot/`. On next restart, the bot skips the QR scan and reconnects instantly. If the session expires, it **automatically re-authenticates** with a new QR code.
+
+<Caption>Zero config. Zero webhooks. Runs entirely on your machine.</Caption>
+
+</Section>
+
+<Section id="architecture" title="Architecture">
+
+The SDK is built in **10 modular layers**, each with a single responsibility. Replace any layer without touching the rest.
+
+<CodeBlock lang="diagram" lineHeight="1.3" showLineNumbers={false}>
+{`┌─────────────────────────────────────────────────────────┐
+│                      WeChatBot                           │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐    │
+│  │              Middleware Engine                    │    │
+│  │    logging → filter → rate-limit → handler      │    │
+│  └──────────────────────┬──────────────────────────┘    │
+│                         │                               │
+│  ┌──────────┐  ┌───────┴───┐  ┌──────────┐  ┌───────┐  │
+│  │  Poller  │  │  Sender   │  │  Typing  │  │ Media │  │
+│  │ (receive)│  │  (send)   │  │  Service │  │ Up/Dn │  │
+│  └────┬─────┘  └─────┬─────┘  └────┬─────┘  └───┬───┘  │
+│       │              │              │            │       │
+│  ┌────┴──────────────┴──────────────┴────────────┴──┐   │
+│  │              Context Store                        │   │
+│  │         (context_token lifecycle)                 │   │
+│  └──────────────────────┬───────────────────────────┘   │
+│                         │                               │
+│  ┌──────────────────────┴───────────────────────────┐   │
+│  │               iLink API                           │   │
+│  │           (protocol layer)                        │   │
+│  └──────────────────────┬───────────────────────────┘   │
+│                         │                               │
+│  ┌──────────────────────┴───────────────────────────┐   │
+│  │              HTTP Client                          │   │
+│  │         (transport + retry)                       │   │
+│  └──────────────────────┬───────────────────────────┘   │
+│                         │                               │
+│  ┌──────────────────────┴───────────────────────────┐   │
+│  │              Storage                              │   │
+│  │    file │ memory │ custom (Redis, SQLite...)      │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘`}
+</CodeBlock>
+
+Each layer is independently testable, replaceable, and composable. The `WeChatBot` class orchestrates them all — but you can also use individual components directly for advanced scenarios.
+
+<Caption>42 source files. 41 tests. 0 runtime dependencies.</Caption>
+
+</Section>
+
+<Section id="how-it-works" title="How it works">
+
+The WeChat iLink Bot protocol uses **QR code login** + **HTTP long-polling** for messages. Here's the flow:
+
+<CodeBlock lang="diagram" lineHeight="1.3" showLineNumbers={false}>
+{`┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│  WeChat User │     │   iLink Server   │     │   Your Bot      │
+└──────┬───────┘     └────────┬─────────┘     └────────┬────────┘
+       │                      │                        │
+       │                      │   GET /get_bot_qrcode  │
+       │                      │<───────────────────────│
+       │                      │───────────────────────>│ QR URL
+       │   Scan QR in WeChat  │                        │
+       │─────────────────────>│                        │
+       │                      │   status: confirmed    │
+       │                      │───────────────────────>│ bot_token
+       │                      │                        │
+       │  "Hello"             │                        │
+       │─────────────────────>│                        │
+       │                      │  POST /getupdates      │
+       │                      │<───────────────────────│
+       │                      │───────────────────────>│ message + context_token
+       │                      │                        │
+       │                      │  POST /sendtyping      │
+       │                      │<───────────────────────│
+       │  "typing..."         │                        │
+       │<─────────────────────│                        │
+       │                      │                        │
+       │                      │  POST /sendmessage     │
+       │                      │<───────────────────────│ context_token + reply
+       │  "Echo: Hello"       │                        │
+       │<─────────────────────│                        │
+       │                      │                        │`}
+</CodeBlock>
+
+The critical protocol concept is `context_token` — every reply **must** echo back the token from the incoming message. The SDK manages this automatically, caching tokens per user and persisting them across restarts.
+
+</Section>
+
+<Section id="middleware" title="Middleware">
+
+The middleware pipeline is an **Express/Koa-style** chain that runs before message handlers. Each middleware can transform, filter, or short-circuit messages.
+
+```typescript
+import {
+  WeChatBot,
+  loggingMiddleware,
+  rateLimitMiddleware,
+  typeFilterMiddleware,
+  filterMiddleware,
+} from '@anthropic/wechatbot'
+
+const bot = new WeChatBot()
+
+// Built-in middleware
+bot.use(loggingMiddleware(bot.logger))           // Log every message
+bot.use(rateLimitMiddleware({                     // Rate limit per user
+  maxMessages: 10, windowMs: 60_000
+}))
+bot.use(typeFilterMiddleware('text', 'image'))    // Only text & images
+bot.use(filterMiddleware(/^\/\w+/))              // Only /commands
+```
+
+Write **custom middleware** — parse commands, inject context, measure timing:
+
+```typescript
+// Command parser middleware
+bot.use(async (ctx, next) => {
+  const text = ctx.message.text.trim()
+  if (text.startsWith('/')) {
+    const [cmd, ...args] = text.slice(1).split(/\s+/)
+    ctx.state.set('command', cmd?.toLowerCase())
+    ctx.state.set('args', args)
+  }
+  await next()
+})
+
+// Response timer
+bot.use(async (ctx, next) => {
+  const start = Date.now()
+  await next()
+  console.log(`Processed in ${Date.now() - start}ms`)
+})
+```
+
+Middleware that doesn't call `next()` **stops the chain** — perfect for auth checks, spam filters, or command routing.
+
+<Caption>Composable. Testable. Each middleware is a pure function.</Caption>
+
+</Section>
+
+<Section id="media" title="Media handling">
+
+Full support for **images, files, voice, and video** — both download and upload. The SDK handles AES-128-ECB encryption, CDN communication, and dual key format decoding transparently.
+
+```typescript
+bot.onMessage(async (msg) => {
+  // Download image from incoming message
+  if (msg.type === 'image' && msg.images[0]?.media) {
+    const data = await bot.downloadMedia(
+      msg.images[0].media,
+      msg.images[0].aeskey
+    )
+    await writeFile('photo.jpg', data)
+    await bot.reply(msg, `Downloaded ${data.length} bytes`)
+  }
+
+  // Voice messages include transcription
+  if (msg.type === 'voice' && msg.voices[0]?.text) {
+    await bot.reply(msg, `You said: "${msg.voices[0].text}"`)
+  }
+
+  // File download
+  if (msg.type === 'file' && msg.files[0]?.media) {
+    const fileData = await bot.downloadMedia(msg.files[0].media)
+    await bot.reply(msg, `Got: ${msg.files[0].fileName}`)
+  }
+})
+```
+
+Upload files to users:
+
+```typescript
+import { MediaType } from '@anthropic/wechatbot'
+
+const result = await bot.sendMedia(userId, {
+  data: imageBuffer,
+  userId,
+  mediaType: MediaType.IMAGE,
+})
+```
+
+The CDN crypto layer handles both key formats automatically — `base64(raw 16 bytes)` and `base64(hex string)`, plus direct hex strings from `image_item.aeskey`.
+
+<Caption>AES-128-ECB. Dual key format. CDN upload/download. All transparent.</Caption>
+
+</Section>
+
+<Section id="storage" title="Pluggable storage">
+
+All SDK state — credentials, poll cursors, context tokens, typing tickets — is persisted through a **pluggable storage interface**. Swap backends without changing any bot code.
+
+```typescript
+import { WeChatBot, FileStorage, MemoryStorage } from '@anthropic/wechatbot'
+
+// File storage (default) — survives restarts
+const bot1 = new WeChatBot({ storage: 'file' })
+
+// Memory storage — fast, ephemeral
+const bot2 = new WeChatBot({ storage: 'memory' })
+
+// Custom storage — implement 5 methods
+class RedisStorage {
+  async get(key) { /* redis.get */ }
+  async set(key, value) { /* redis.set */ }
+  async delete(key) { /* redis.del */ }
+  async has(key) { /* redis.exists */ }
+  async clear() { /* redis.flushdb */ }
+}
+
+const bot3 = new WeChatBot({ storage: new RedisStorage() })
+```
+
+File storage saves each key as a JSON file in `~/.wechatbot/` with `0600` permissions. Context tokens are flushed to disk after each message batch, so they survive process restarts.
+
+</Section>
+
+<Section id="events" title="Events">
+
+The bot emits **typed events** for lifecycle monitoring. Full IntelliSense in TypeScript.
+
+```typescript
+bot.on('login', (creds) => {
+  console.log(`Logged in: ${creds.accountId}`)
+})
+
+bot.on('session:expired', () => {
+  console.log('Session expired — re-login happening automatically')
+})
+
+bot.on('session:restored', (creds) => {
+  console.log(`Back online: ${creds.accountId}`)
+})
+
+bot.on('error', (err) => {
+  alerting.send(`Bot error: ${err}`)
+})
+
+bot.on('poll:start', () => console.log('Polling started'))
+bot.on('poll:stop', () => console.log('Polling stopped'))
+bot.on('close', () => console.log('Bot shut down'))
+```
+
+Session recovery is **fully automatic** — when a `-14` (session timeout) error is received, the SDK clears all state, re-runs the QR login flow, and resumes polling. No manual intervention needed.
+
+</Section>
+
+<Section id="message-builder" title="Message builder">
+
+For complex messages with multiple items, use the **fluent builder API**:
+
+```typescript
+const msg = bot.createMessage(userId)
+  .text("Here's your report:")
+  .file({
+    media: cdnMediaRef,
+    fileName: 'Q1-report.pdf',
+    size: 542188,
+  })
+  .build()
+
+await bot.sendMessage(msg)
+```
+
+Long text is **automatically chunked** at natural boundaries — paragraphs first, then line breaks, then spaces. Each chunk gets its own `client_id` but shares the same `context_token`.
+
+```typescript
+// Smart chunking — splits a 5000-char text into ~3 messages
+// Priority: paragraph break → line break → space → hard cut at 2000
+await bot.reply(msg, veryLongText)
+```
+
+</Section>
+
+<Section id="comparison" title="Comparison">
+
+How this SDK compares to the original `weixin-bot` implementation.
+
+<ComparisonTable
+  title="vs weixin-bot (original)"
+  headers={['Feature', 'weixin-bot', 'wechatbot (this)']}
+  rows={[
+    ['Architecture', 'Flat, monolithic (4 files)', 'Layered, modular (42 files)'],
+    ['Media', 'Text only', 'Image / File / Voice / Video'],
+    ['Middleware', 'None', 'Express-style pipeline'],
+    ['Storage', 'File only, hardcoded', 'Pluggable (file / memory / custom)'],
+    ['context_token', 'In-memory, lost on restart', 'Persisted + auto-restored'],
+    ['Typing', 'No ticket caching', '24h ticket cache'],
+    ['Errors', 'Single ApiError class', '6 typed error classes'],
+    ['Events', 'Handler array', 'Typed EventEmitter'],
+    ['Text chunking', 'Hard cut at 2000', 'Smart split (para → line → space)'],
+    ['CDN crypto', 'None', 'AES-128-ECB, dual key format'],
+    ['Tests', 'None', '41 unit tests'],
+  ]}
+/>
+
+<ComparisonTable
+  title="vs Telegram Bot SDK"
+  headers={['', 'Telegram Bot API', 'WeChatBot (iLink)']}
+  rows={[
+    ['Message receiving', 'getUpdates or webhook', 'Long-poll only (getupdates)'],
+    ['Reply targeting', 'chat_id is enough', 'context_token required'],
+    ['Media upload', 'multipart/form-data', 'AES-128-ECB + CDN'],
+    ['Typing', 'sendChatAction', 'getconfig → sendtyping'],
+    ['Session', 'Permanent token', 'Expires, needs QR re-login'],
+  ]}
+/>
+
+</Section>
+
+<Section id="protocol" title="Protocol overview">
+
+The iLink Bot API is HTTP/JSON based with these core endpoints:
+
+- **`GET /get_bot_qrcode`** — request a QR code for login
+- **`GET /get_qrcode_status`** — poll for scan → confirmed → get `bot_token`
+- **`POST /getupdates`** — long-poll for incoming messages (35s hold)
+- **`POST /sendmessage`** — send text or media messages
+- **`POST /getconfig`** — get `typing_ticket` for a user
+- **`POST /sendtyping`** — show/hide "typing..." indicator
+- **`POST /getuploadurl`** — request CDN upload parameters
+- **`POST CDN /upload`** — upload AES-encrypted media
+- **`GET CDN /download`** — download AES-encrypted media
+
+Every POST request requires: `Authorization: Bearer <bot_token>`, `AuthorizationType: ilink_bot_token`, and a random `X-WECHAT-UIN` header. All request bodies include `base_info: { channel_version: "2.0.0" }`.
+
+The most critical concept is `context_token` — it's **not optional**. Without it, replies cannot be routed to the correct WeChat conversation. The SDK caches it per `(accountId, userId)` pair and persists it to storage.
+
+</Section>
+
+<Section id="security" title="Security & privacy">
+
+Everything runs **on your machine**. No remote servers, no accounts, no telemetry.
+
+- **Local only** — all API calls go directly from your machine to `ilinkai.weixin.qq.com`
+- **Credentials encrypted at rest** — stored with `0600` permissions in `~/.wechatbot/`
+- **No proxy or relay** — the SDK communicates directly with WeChat's iLink servers
+- **Media encryption** — all CDN uploads/downloads use AES-128-ECB; files are encrypted locally before upload
+- **Session isolation** — each bot instance manages its own credentials and state independently
+
+</Section>
