@@ -1,4 +1,4 @@
-# wechatbot-agent — Pi Extension for WeChat
+# wechatbot-pi-agent — Pi Extension for WeChat
 
 A **pi extension** that bridges WeChat to your Pi coding agent.
 Scan a QR code in WeChat → chat with Pi from your phone.
@@ -28,17 +28,17 @@ Scan a QR code in WeChat → chat with Pi from your phone.
 ### Option 1: Load directly
 
 ```bash
-pi -e /path/to/wechatbot/agent/src/index.ts
+pi -e /path/to/wechatbot/pi-agent/src/index.ts
 ```
 
 ### Option 2: Copy to extensions directory
 
 ```bash
 # Global
-cp -r agent/ ~/.pi/agent/extensions/wechat-bridge/
+cp -r pi-agent/ ~/.pi/agent/extensions/wechat-bridge/
 
 # Or project-local
-cp -r agent/ .pi/extensions/wechat-bridge/
+cp -r pi-agent/ .pi/extensions/wechat-bridge/
 ```
 
 Then it auto-loads on every `pi` session.
@@ -131,10 +131,10 @@ WeChat user sends "帮我重构 auth 模块"
 ## Files
 
 ```
-agent/
+pi-pi-agent/
 ├── src/
-│   ├── index.ts      # Pi extension — commands, events, bridge logic
-│   └── wechat.ts     # WeChat iLink client (QR login, poll, send)
+│   └── index.ts      # Pi extension — commands, events, bridge logic
+│                      # Uses @anthropic/wechatbot SDK for all iLink operations
 ├── package.json
 ├── tsconfig.json
 └── README.md

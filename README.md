@@ -10,13 +10,13 @@ Let any agent connect to WeChat in 5 minutes. Inspired by [tencent-weixin/opencl
 
 ```bash
 # Load the extension
-pi -e /path/to/wechatbot/agent/src/index.ts
+pi -e /path/to/wechatbot/pi-agent/src/index.ts
 
 # Then in pi:
 /wechat          # Shows QR code → scan in WeChat → connected!
 ```
 
-See [agent/README.md](agent/README.md) for full docs.
+See [pi-agent/README.md](pi-agent/README.md) for full docs.
 
 ## SDKs
 
@@ -107,7 +107,7 @@ All SDKs share the same capabilities:
 | Document | Description |
 |---|---|
 | [docs/protocol.md](docs/protocol.md) | iLink Bot API protocol reference |
-| [agent/README.md](agent/README.md) | Pi extension (WeChat ↔ Pi bridge) |
+| [pi-agent/README.md](pi-agent/README.md) | Pi extension (WeChat ↔ Pi bridge) |
 | [docs/architecture.md](docs/architecture.md) | Architecture & SDK comparison |
 | [nodejs/README.md](nodejs/README.md) | Node.js SDK docs |
 | [golang/README.md](golang/README.md) | Go SDK docs |
@@ -125,7 +125,7 @@ cd website && npm run dev  # http://localhost:8045
 
 ```
 wechatbot/
-├── agent/              # Pi extension (WeChat ↔ Pi bridge)
+├── pi-agent/              # Pi extension (WeChat ↔ Pi bridge)
 │   ├── src/index.ts    # Extension entry (commands, events)
 │   └── src/wechat.ts   # WeChat iLink client
 ├── nodejs/             # Node.js SDK (TypeScript)
