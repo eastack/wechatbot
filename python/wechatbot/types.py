@@ -82,9 +82,14 @@ class VideoContent:
 
 @dataclass
 class QuotedMessage:
-    title: str | None = None
+    timestamp: datetime
     text: str | None = None
     type: ContentType | None = None
+    images: list[ImageContent] = field(default_factory=list)
+    voices: list[VoiceContent] = field(default_factory=list)
+    files: list[FileContent] = field(default_factory=list)
+    videos: list[VideoContent] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +104,7 @@ class Credentials:
 @dataclass
 class DownloadedMedia:
     """Result of downloading media from a message."""
+
     data: bytes
     type: Literal["image", "file", "video", "voice"]
     file_name: str | None = None
@@ -108,6 +114,7 @@ class DownloadedMedia:
 @dataclass
 class UploadResult:
     """Result of uploading media to CDN."""
+
     media: CDNMedia
     aes_key: bytes
     encrypted_file_size: int

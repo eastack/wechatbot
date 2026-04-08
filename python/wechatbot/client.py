@@ -509,6 +509,74 @@ class WeChatBot:
         if uid and ct:
             self._context_tokens[uid] = ct
 
+
+    def _parse_quoted_message(self, raw: dict[str, Any]) -> QuotedMessage | None:
+        item = raw.get("message_item", {})
+        images, voices, files, videos = [], [], [], []
+
+        t = item.get("type")
+        if t == MessageItemType.IMAGE and item.get("image_item"):
+            ii = item["image_item"]
+            media = _parse_cdn_media(ii.get("media"))
+            images.append(
+                ImageContent(
+                    media=media,
+                    thumb_media=_parse_cdn_media(ii.get("thumb_media")),
+                    aes_key=ii.get("aeskey"),
+                    url=ii.get("url"),
+                    width=ii.get("thumb_width"),
+                    height=ii.get("thumb_height"),
+                )
+            )
+        elif t == MessageItemType.VOICE and item.get("voice_item"):
+            vi = item["voice_item"]
+            voices.append(
+                VoiceContent(
+                    media=_parse_cdn_media(vi.get("media")),
+                    text=vi.get("text"),
+                    duration_ms=vi.get("playtime"),
+                    encode_type=vi.get("encode_type"),
+                )
+            )
+        elif t == MessageItemType.FILE and item.get("file_item"):
+            fi = item["file_item"]
+            size = None
+            if fi.get("len"):
+                try:
+                    size = int(fi["len"])
+                except (ValueError, TypeError):
+                    pass
+            files.append(
+                FileContent(
+                    media=_parse_cdn_media(fi.get("media")),
+                    file_name=fi.get("file_name"),
+                    md5=fi.get("md5"),
+                    size=size,
+                )
+            )
+        elif t == MessageItemType.VIDEO and item.get("video_item"):
+            vi = item["video_item"]
+            videos.append(
+                VideoContent(
+                    media=_parse_cdn_media(vi.get("media")),
+                    thumb_media=_parse_cdn_media(vi.get("thumb_media")),
+                    duration_ms=vi.get("play_length"),
+                )
+            )
+
+        return QuotedMessage(
+            text=_extract_text([item]),
+            type=_detect_type([item]),
+            timestamp=datetime.fromtimestamp(
+                raw.get("create_time_ms", 0) / 1000, tz=timezone.utc
+            ),
+            images=images,
+            voices=voices,
+            files=files,
+            videos=videos,
+            raw=raw,
+        )
+
     def _parse_message(self, raw: dict[str, Any]) -> IncomingMessage | None:
         if raw.get("message_type") != MessageType.USER:
             return None
@@ -554,9 +622,7 @@ class WeChatBot:
                     duration_ms=vi.get("play_length"),
                 ))
             if item.get("ref_msg"):
-                ref = item["ref_msg"]
-                qt = ref.get("message_item", {}).get("text_item", {}).get("text")
-                quoted = QuotedMessage(title=ref.get("title"), text=qt)
+                quoted = self._parse_quoted_message(item["ref_msg"])
 
         return IncomingMessage(
             user_id=raw["from_user_id"],
@@ -593,7 +659,7 @@ class WeChatBot:
         print(f"[wechatbot] {msg}", file=sys.stderr)
 
 
-def _detect_type(items: list[dict[str, Any]]) -> str:
+def _detect_type(items: list[dict[str, Any]]) -> ContentType:
     if not items:
         return "text"
     t = items[0].get("type")
