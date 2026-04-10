@@ -169,7 +169,7 @@ class WeChatBot:
 
     # ── Download ───────────────────────────────────────────────────
 
-    async def download(self, msg: IncomingMessage) -> DownloadedMedia | None:
+    async def download(self, msg: IncomingMessage | QuotedMessage) -> DownloadedMedia | None:
         """Download media from an incoming message.
 
         Returns None if the message has no media.
